@@ -26,3 +26,6 @@ output/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Agent trace 记录（运行时产物）
+traces/

@@ -257,3 +257,133 @@ b  = 0.75  控制长度惩罚强度（标准经验值）
 | 速度 | ✅ 极快 | ⚠️ 较慢 |
 
 **生产系统常用混合检索**：两路都跑，结果融合。医学报告这类场景，关键词检索其实更准——「血糖」就是「血糖」，不需要语义泛化。
+
+---
+
+## 第 4 周 · 体检报告智能助手（`week04_project/`）
+
+**目标**：把前两周的 Agent 与 RAG 合成一个完整可用的系统，加上 trace 日志与测试用例。
+
+### 架构
+
+```
+用户提问
+   ↓
+Agent 主循环（模型决定调哪个工具）
+   ├─ search_report    BM25 检索（复用第 3 周）
+   ├─ get_indicator    按指标名精确取值
+   ├─ list_abnormal    列出所有异常指标
+   └─ calculate_bmi    按身高体重算 BMI
+   ↓
+最终答案 + trace 日志（JSON，可回放）
+```
+
+### 文件说明
+
+| 文件 | 职责 |
+|---|---|
+| `retrieval.py` | BM25 检索（从 week03 抽取成可复用模块） |
+| `tools.py` | 4 个工具的实现 + 给模型看的 schema + 注册表 |
+| `agent.py` | 主循环、trace 记录、测试用例 |
+| `selftest.py` | 不调模型的模块自测（验证工具能独立工作） |
+| `data/report.txt` | 体检报告语料 |
+| `traces/` | 运行时生成的 trace JSON（已 gitignore） |
+
+运行：
+
+```bash
+python selftest.py                                  # 工具自测，不花钱
+python agent.py                                     # 跑 6 个测试用例
+python agent.py --question "血糖是多少" --trace      # 单问 + 保存 trace
+```
+
+### 6 个测试用例的结果
+
+| # | 问题 | 期望 | 实际 |
+|---|---|---|---|
+| 1 | 我的血糖是多少？ | 答出 7.2 | ✅ get_indicator → 7.2 偏高 |
+| 2 | 肝功能有问题吗？ | ALT 55 偏高 | ✅ 多工具协同 |
+| 3 | 有哪些异常指标？ | 列出异常项 | ✅ list_abnormal → 表格 |
+| 4 | 身高172体重78算BMI | calculate_bmi | ✅ 26.4 超重 |
+| 5 | 报告里的医生是谁？ | 王医生 | ✅ search_report |
+| 6 | 我的血型是什么？ | 未提及 | ✅ **两次尝试后诚实拒答** |
+
+**用例 6 是最有价值的一次**：模型先调 `get_indicator("血型")` 失败，又换 `search_report("血型 ABO Rh")` 再失败，第三次才回答「未提及，建议单独做血型鉴定」。
+
+**它没有一次失败就放弃，也没有编造答案。**
+
+### Trace 日志
+
+每次对话都记录完整步骤，示例：
+
+```json
+{
+  "question": "我的血糖是多少？",
+  "timestamp": "2026-11-07T10:18:29",
+  "steps": 2,
+  "trace": [
+    {"round": 1, "type": "tool_call", "tool": "get_indicator",
+     "args": {"name": "血糖"}, "result": "空腹血糖(GLU)：7.2 ...", "elapsed_ms": 0},
+    {"round": 2, "type": "text", "text": "你的空腹血糖是 7.2 mmol/L ..."}
+  ]
+}
+```
+
+**为什么 trace 重要**：用户说「答错了」时，能精确定位是**模型选错工具**、**参数给错**、还是**工具返回错数据**。没有 trace 只能靠猜。
+
+### 踩过的坑
+
+**1. 系统代理导致 SSL 连接被断**
+
+报错：
+```
+SSL: UNEXPECTED_EOF_WHILE_READING  (固定 5 秒后失败)
+```
+
+排查过程：
+- DNS 正常、TLS 握手成功（TLSv1.3）
+- 手工 socket 发请求 → **HTTP 200 成功**
+- `http.client` → **成功**
+- `urllib` → **全部失败**
+- Node 的 fetch → **成功**
+
+根因：`urllib` 会读 Windows 系统代理（`127.0.0.1:7897`，Clash 默认端口），而该代理在转发到本 API 时会中断连接。Node 的 fetch 默认不读系统代理，所以不受影响。
+
+修复：
+```python
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+with opener.open(req, timeout=60) as resp:
+    ...
+```
+
+> 教训：`urllib` 的「贴心」有时是陷阱。排查 HTTP 问题的顺序应当是：先确认网络层（DNS/TLS），再确认应用层（手工 socket），最后才怀疑代码。
+
+**2. Agent 路径不可复现**
+
+同样的 `temperature=0`，同样的 6 个用例，两次运行的工具调用序列不同：
+
+| 用例 | 第一次 | 第二次 |
+|---|---|---|
+| 肝功能 | `get_indicator ×2 + search_report` | `search_report + list_abnormal` |
+
+原因：多轮对话中每一轮的上下文不同，模型的选择会漂移。
+
+**这是 Agent 测试的核心难点**——答案可以一致，但路径不保证一致。因此评估标准应该是「**最终答案是否正确**」，而不是「是否按预期路径执行」。
+
+**3. `list_abnormal` 只覆盖一半异常项**
+
+工具只返回带 `[偏高 ↑]` 标记的 4 个生化指标，但报告总结里列了 5 条异常（含「体重超重」「血压偏高」这些没有标记的文字描述）。
+
+模型照搬了工具的返回，说「共 4 项异常」。
+
+> **工具的边界就是 Agent 的边界。** 工具看不到的东西，Agent 答不出来。改进方向是让 Agent 同时调 `list_abnormal` 和 `search_report("异常提示")`，但这又需要在 Prompt 里明确告诉它「这个工具不全」。
+
+### 与「AI 调试」岗的对应关系
+
+| JD 要求 | 本项目对应 |
+|---|---|
+| 排查输出幻觉 | 用例 6：工具查不到时必须拒答 |
+| 逻辑校验 | trace 中可看到每步的工具与参数 |
+| 异常排查 | 三种错误处理：工具不存在、参数错误、返回值非法 |
+| 输出调试报告 | `traces/*.json` 完整的「现象→步骤→结果」 |
+| 测试用例设计 | 6 个用例覆盖正常/边界/不存在三类 |
